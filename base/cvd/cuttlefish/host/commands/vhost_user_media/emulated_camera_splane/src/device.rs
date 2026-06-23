@@ -219,12 +219,19 @@ impl EmulatedCameraSession {
     ) -> IoctlResult<()> {
         if self.pipe.is_none() {
             if let Some(path) = camera_pipe {
-                match File::open(path) {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Open the pipe in non-blocking mode
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                {
                     Ok(file) => {
                         self.pipe = Some(file);
+                        log::info!("Successfully opened camera Named Pipe in non-blocking mode.");
                     }
                     Err(_) => {
-                        return Err(libc::EIO);
+                        // Pipe file itself doesn't exist yet, fall back immediately.
                     }
                 }
             }
@@ -239,9 +246,31 @@ impl EmulatedCameraSession {
                 .seek(SeekFrom::Start(0))
                 .map_err(|_| libc::EIO)?;
 
+            let mut frame_written = false;
+
             if let Some(ref mut pipe) = self.pipe {
-                Self::read_and_write_yuv_frame(pipe, buffer.fd.as_file()).map_err(|_| libc::EIO)?;
-            } else {
+                let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
+                let mut frame_data = vec![0u8; frame_size];
+                // Attempt a non-blocking read
+                match pipe.read_exact(&mut frame_data) {
+                    Ok(_) => {
+                        if let Ok(_) = buffer.fd.as_file().write_all(&frame_data) {
+                            frame_written = true;
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Pipe is empty, fall back silently to rainbow pattern
+                    }
+                    Err(e) => {
+                        // EOF or pipe read error, disconnect the pipe to force reopen next time
+                        log::warn!("Pipe read error/EOF ({}), disconnecting pipe.", e);
+                        self.pipe = None;
+                    }
+                }
+            }
+
+            if !frame_written {
+                // Fallback / Pattern Mode: Render the YUV rainbow pattern
                 Self::write_yuv420_pattern(iteration, buffer.fd.as_file()).map_err(|_| libc::EIO)?;
             }
 
