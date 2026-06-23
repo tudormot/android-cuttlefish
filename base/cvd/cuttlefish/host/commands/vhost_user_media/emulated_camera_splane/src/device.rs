@@ -13,17 +13,12 @@
 // limitations under the License.
 
 use std::collections::VecDeque;
-use std::io::BufWriter;
-use std::io::Cursor;
 use std::io::Result as IoResult;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
-
-use image::ColorType;
-use image::codecs::jpeg::JpegEncoder;
 use v4l2r::PixelFormat;
 use v4l2r::QueueType;
 use v4l2r::bindings;
@@ -170,30 +165,36 @@ impl VirtioMediaDeviceSession for EmulatedCameraSession {
 }
 
 impl EmulatedCameraSession {
-    fn write_pattern<W: std::io::Write>(iteration: u64, sink: W) -> IoctlResult<()> {
-        let buffer_size: u32 = BYTES_PER_LINE * HEIGHT;
-        let mut rgb_buffer: Vec<u8> = vec![0; buffer_size as usize];
-        for i in (0..buffer_size).step_by(3) {
-            rgb_buffer[i as usize] = 0xffu8 * (iteration as u8 % 2);
-            rgb_buffer[i as usize + 1] = 0x55u8 * (iteration as u8 % 3);
-            rgb_buffer[i as usize + 2] = 0x10u8 * (iteration as u8 % 16);
+    pub fn write_yuv420_pattern<W: std::io::Write>(iteration: u64, mut sink: W) -> std::io::Result<()> {
+        let w = WIDTH as usize;
+        let h = HEIGHT as usize;
+        let y_size = w * h;
+        let uv_size = y_size / 4;
+        
+        let mut y_bytes = vec![0u8; y_size];
+        for y in 0..h {
+            for x in 0..w {
+                let val = ((x + y + (iteration as usize * 4)) % 256) as u8;
+                y_bytes[y * w + x] = val;
+            }
         }
-        // Compress buffer into a new JPEG buffer
-        let mut compressed_buffer = Vec::new();
-        {
-            let mut encoder =
-                JpegEncoder::new_with_quality(Cursor::new(&mut compressed_buffer), 95);
-            encoder
-                .encode(&rgb_buffer, WIDTH, HEIGHT, ColorType::Rgb8)
-                .map_err(|_| libc::EIO)?;
+        
+        let mut u_bytes = vec![0u8; uv_size];
+        let mut v_bytes = vec![0u8; uv_size];
+        let uw = w / 2;
+        let uh = h / 2;
+        for y in 0..uh {
+            for x in 0..uw {
+                let u_val = ((x * 8 + (iteration as usize * 2)) % 256) as u8;
+                let v_val = ((y * 8 + (iteration as usize * 3)) % 256) as u8;
+                u_bytes[y * uw + x] = u_val;
+                v_bytes[y * uw + x] = v_val;
+            }
         }
-        let mut writer = BufWriter::new(sink);
-        let _ = writer.write(&compressed_buffer).map_err(|_| libc::EIO)?;
-        // Fill out the remaining of the buffer with zeros.
-        for _ in compressed_buffer.len()..(BUFFER_SIZE as usize) {
-            let _ = writer.write(&[0]).map_err(|_| libc::EIO)?;
-        }
-
+        
+        sink.write_all(&y_bytes)?;
+        sink.write_all(&u_bytes)?;
+        sink.write_all(&v_bytes)?;
         Ok(())
     }
 
@@ -211,7 +212,7 @@ impl EmulatedCameraSession {
                 .seek(SeekFrom::Start(0))
                 .map_err(|_| libc::EIO)?;
 
-            Self::write_pattern(iteration, buffer.fd.as_file())?;
+            Self::write_yuv420_pattern(iteration, buffer.fd.as_file()).map_err(|_| libc::EIO)?;
 
             *buffer.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
             buffer.set_state(BufferState::Outgoing {
@@ -362,10 +363,10 @@ const FRAME_RATE: u32 = 30;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
-const BYTES_PER_LINE: u32 = WIDTH * 3;
+const BYTES_PER_LINE: u32 = WIDTH;
 
-const PIXELFORMAT: u32 = PixelFormat::from_fourcc(b"MJPG").to_u32();
-const BUFFER_SIZE: u32 = 9040;
+const PIXELFORMAT: u32 = PixelFormat::from_fourcc(b"YU12").to_u32();
+const BUFFER_SIZE: u32 = WIDTH * HEIGHT * 3 / 2;
 
 const INPUTS: [bindings::v4l2_input; 1] = [bindings::v4l2_input {
     index: 0,
@@ -854,5 +855,20 @@ where
         } else {
             Err(libc::EINVAL)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_write_yuv420_pattern_size() {
+        let mut buffer = Vec::new();
+        let result = EmulatedCameraSession::write_yuv420_pattern(0, &mut buffer);
+        assert!(result.is_ok());
+        // Verify output size matches exactly 1.5 bytes per pixel (YUV420p)
+        let expected_size = (WIDTH * HEIGHT * 3 / 2) as usize;
+        assert_eq!(buffer.len(), expected_size);
     }
 }

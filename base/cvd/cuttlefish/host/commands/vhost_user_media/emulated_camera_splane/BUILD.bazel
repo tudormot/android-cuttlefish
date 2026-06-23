@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 load("@vhost_user_media_workspace_crates//:defs.bzl", "crate_deps")
 
 package(default_visibility = ["//:android_cuttlefish"])
@@ -42,4 +42,10 @@ echo "platform unsupported" >&2
 exit 1
 EOF""",
     executable = True,
+)
+
+rust_test(
+    name = "emulated_camera_splane_test",
+    crate = ":emulated_camera_splane_binary",
+    edition = "2024",
 )
