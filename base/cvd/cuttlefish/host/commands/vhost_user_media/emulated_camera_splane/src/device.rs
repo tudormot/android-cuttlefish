@@ -22,6 +22,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use v4l2r::PixelFormat;
 use v4l2r::QueueType;
 use v4l2r::bindings;
@@ -147,8 +149,7 @@ impl Buffer {
     }
 }
 
-/// Session data of [`EmulatedCamera`].
-pub struct EmulatedCameraSession {
+struct SessionSharedState {
     /// Id of the session.
     id: u32,
     /// Current iteration of the pattern generation cycle.
@@ -159,8 +160,26 @@ pub struct EmulatedCameraSession {
     queued_buffers: VecDeque<usize>,
     /// Is the session currently streaming?
     streaming: bool,
-    /// Named pipe for streaming YUV frames from host.
-    pipe: Option<File>,
+}
+
+/// Session data of [`EmulatedCamera`].
+pub struct EmulatedCameraSession {
+    shared: Arc<Mutex<SessionSharedState>>,
+    /// Flag to signal the background reader thread to exit.
+    exit_flag: Arc<AtomicBool>,
+    /// Handle to join the background reader thread on session drop.
+    reader_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for EmulatedCameraSession {
+    fn drop(&mut self) {
+        log::info!("Dropping EmulatedCameraSession, stopping reader thread...");
+        self.exit_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+        log::info!("EmulatedCameraSession reader thread stopped successfully.");
+    }
 }
 
 impl VirtioMediaDeviceSession for EmulatedCameraSession {
@@ -208,84 +227,6 @@ impl EmulatedCameraSession {
         let mut frame_data = vec![0u8; frame_size];
         source.read_exact(&mut frame_data)?;
         sink.write_all(&frame_data)?;
-        Ok(())
-    }
-
-    /// Write basic pattern into the queued buffers
-    fn process_queued_buffers<Q: VirtioMediaEventQueue>(
-        &mut self,
-        evt_queue: &mut Q,
-        camera_pipe: &Option<PathBuf>,
-    ) -> IoctlResult<()> {
-        if self.pipe.is_none() {
-            if let Some(path) = camera_pipe {
-                use std::os::unix::fs::OpenOptionsExt;
-                // Open the pipe in non-blocking mode
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(path)
-                {
-                    Ok(file) => {
-                        self.pipe = Some(file);
-                        log::info!("Successfully opened camera Named Pipe in non-blocking mode.");
-                    }
-                    Err(_) => {
-                        // Pipe file itself doesn't exist yet, fall back immediately.
-                    }
-                }
-            }
-        }
-
-        while let Some(buf_id) = self.queued_buffers.pop_front() {
-            let iteration = self.iteration;
-            let buffer = self.buffers.get_mut(buf_id).ok_or(libc::EIO)?;
-            buffer
-                .fd
-                .as_file()
-                .seek(SeekFrom::Start(0))
-                .map_err(|_| libc::EIO)?;
-
-            let mut frame_written = false;
-
-            if let Some(ref mut pipe) = self.pipe {
-                let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
-                let mut frame_data = vec![0u8; frame_size];
-                // Attempt a non-blocking read
-                match pipe.read_exact(&mut frame_data) {
-                    Ok(_) => {
-                        if let Ok(_) = buffer.fd.as_file().write_all(&frame_data) {
-                            frame_written = true;
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Pipe is empty, fall back silently to rainbow pattern
-                    }
-                    Err(e) => {
-                        // EOF or pipe read error, disconnect the pipe to force reopen next time
-                        log::warn!("Pipe read error/EOF ({}), disconnecting pipe.", e);
-                        self.pipe = None;
-                    }
-                }
-            }
-
-            if !frame_written {
-                // Fallback / Pattern Mode: Render the YUV rainbow pattern
-                Self::write_yuv420_pattern(iteration, buffer.fd.as_file()).map_err(|_| libc::EIO)?;
-            }
-
-            *buffer.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
-            buffer.set_state(BufferState::Outgoing {
-                sequence: iteration as u32,
-            });
-            evt_queue.send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
-                self.id,
-                buffer.v4l2_buffer.clone(),
-            )));
-
-            self.iteration += 1;
-        }
-
         Ok(())
     }
 }
@@ -349,7 +290,7 @@ where
 
 impl<Q, HM, Reader, Writer> VirtioMediaDevice<Reader, Writer> for EmulatedCamera<Q, HM>
 where
-    Q: VirtioMediaEventQueue,
+    Q: VirtioMediaEventQueue + Clone + Send + 'static,
     HM: VirtioMediaHostMemoryMapper,
     Reader: ReadFromDescriptorChain,
     Writer: WriteToDescriptorChain,
@@ -357,26 +298,164 @@ where
     type Session = EmulatedCameraSession;
 
     fn new_session(&mut self, session_id: u32) -> std::result::Result<Self::Session, i32> {
-        Ok(EmulatedCameraSession {
+        let shared = Arc::new(Mutex::new(SessionSharedState {
             id: session_id,
             iteration: 0,
             buffers: Default::default(),
             queued_buffers: Default::default(),
             streaming: false,
-            pipe: None,
+        }));
+
+        let exit_flag = Arc::new(AtomicBool::new(false));
+
+        let shared_clone = shared.clone();
+        let exit_flag_clone = exit_flag.clone();
+        let mut evt_queue_clone = self.evt_queue.clone();
+        let camera_pipe = self.camera_pipe.clone();
+
+        let reader_thread = std::thread::spawn(move || {
+            let mut pipe: Option<File> = None;
+            let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
+            let mut read_buffer = Vec::with_capacity(frame_size);
+
+            log::info!("Background reader thread started for session {}", session_id);
+
+            while !exit_flag_clone.load(Ordering::SeqCst) {
+                let mut frame_read_successfully = false;
+
+                if let Some(ref path) = camera_pipe {
+                    let pipe_path = path.to_str().unwrap();
+                    if pipe.is_none() {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        match std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(pipe_path)
+                        {
+                            Ok(file) => {
+                                pipe = Some(file);
+                                read_buffer.clear();
+                                log::info!("Reader thread successfully opened non-blocking pipe {}", pipe_path);
+                            }
+                            Err(_) => {
+                                // Pipe not available, will fall back
+                            }
+                        }
+                    }
+
+                    if let Some(ref mut file) = pipe {
+                        let needed = frame_size - read_buffer.len();
+                        let mut temp_buf = vec![0u8; needed];
+
+                        match file.read(&mut temp_buf) {
+                            Ok(0) => {
+                                log::warn!("Reader thread: pipe EOF detected (writer disconnected).");
+                                pipe = None;
+                                read_buffer.clear();
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            Ok(n) => {
+                                read_buffer.extend_from_slice(&temp_buf[..n]);
+                                if read_buffer.len() == frame_size {
+                                    let mut shared = shared_clone.lock().unwrap();
+                                    if shared.streaming {
+                                        if let Some(buf_id) = shared.queued_buffers.pop_front() {
+                                            let iteration = shared.iteration;
+                                            let id = shared.id;
+                                            let mut success = false;
+                                            {
+                                                if let Some(buffer) = shared.buffers.get_mut(buf_id) {
+                                                    if let Ok(_) = buffer.fd.as_file().seek(SeekFrom::Start(0)) {
+                                                        if let Ok(_) = buffer.fd.as_file().write_all(&read_buffer) {
+                                                            *buffer.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
+                                                            buffer.set_state(BufferState::Outgoing {
+                                                                sequence: iteration as u32,
+                                                            });
+                                                            evt_queue_clone.send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
+                                                                id,
+                                                                buffer.v4l2_buffer.clone(),
+                                                            )));
+                                                            success = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if success {
+                                                shared.iteration += 1;
+                                            }
+                                        }
+                                    }
+                                    read_buffer.clear();
+                                    frame_read_successfully = true;
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // No data, will fall back
+                            }
+                            Err(e) => {
+                                log::error!("Reader thread: pipe read error: {}", e);
+                                pipe = None;
+                                read_buffer.clear();
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                        }
+                    }
+                }
+
+                if !frame_read_successfully {
+                    let mut shared = shared_clone.lock().unwrap();
+                    if shared.streaming {
+                        if let Some(buf_id) = shared.queued_buffers.pop_front() {
+                            let iteration = shared.iteration;
+                            let id = shared.id;
+                            let mut success = false;
+                            {
+                                if let Some(buffer) = shared.buffers.get_mut(buf_id) {
+                                    if let Ok(_) = buffer.fd.as_file().seek(SeekFrom::Start(0)) {
+                                        if let Ok(_) = EmulatedCameraSession::write_yuv420_pattern(iteration, buffer.fd.as_file()) {
+                                            *buffer.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
+                                            buffer.set_state(BufferState::Outgoing {
+                                                sequence: iteration as u32,
+                                            });
+                                            evt_queue_clone.send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
+                                                id,
+                                                buffer.v4l2_buffer.clone(),
+                                            )));
+                                            success = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if success {
+                                shared.iteration += 1;
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(33));
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            log::info!("Background reader thread exiting for session {}", session_id);
+        });
+
+        Ok(EmulatedCameraSession {
+            shared,
+            exit_flag,
+            reader_thread: Some(reader_thread),
         })
     }
 
     fn close_session(&mut self, session: Self::Session) {
-        // Nothing to cleanup when `close_session` is called for sessions without
-        // allocated buffers, hence the early return.
-        if self.active_session != Some(session.id) {
+        let session_id = session.shared.lock().unwrap().id;
+        if self.active_session != Some(session_id) {
             return;
         }
 
         self.active_session = None;
 
-        for buffer in &session.buffers {
+        let shared = session.shared.lock().unwrap();
+        for buffer in &shared.buffers {
             self.mmap_manager.unregister_buffer(buffer.offset);
         }
     }
@@ -397,7 +476,8 @@ where
         flags: u32,
         offset: u32,
     ) -> std::result::Result<(u64, u64), i32> {
-        let buffer = session
+        let mut shared = session.shared.lock().unwrap();
+        let buffer = shared
             .buffers
             .iter_mut()
             .find(|b| b.offset == offset)
@@ -412,10 +492,8 @@ where
     }
 
     fn do_munmap(&mut self, guest_addr: u64) -> std::result::Result<(), i32> {
-        self.mmap_manager
-            .remove_mapping(guest_addr)
-            .map(|_| ())
-            .map_err(|_| libc::EINVAL)
+        let _ = self.mmap_manager.remove_mapping(guest_addr);
+        Ok(())
     }
 }
 
@@ -644,13 +722,17 @@ where
         if memory != MemoryType::Mmap {
             return Err(libc::EINVAL);
         }
-        if session.streaming {
+        
+        let session_id = session.shared.lock().unwrap().id;
+        let streaming = session.shared.lock().unwrap().streaming;
+
+        if streaming {
             return Err(libc::EBUSY);
         }
         // Buffers cannot be requested on a session if there is already another session with
         // allocated buffers.
         match self.active_session {
-            Some(id) if id != session.id => return Err(libc::EBUSY),
+            Some(id) if id != session_id => return Err(libc::EBUSY),
             _ => (),
         }
 
@@ -660,20 +742,24 @@ where
             self.streamoff(session, queue)?;
         } else {
             // TODO factorize with streamoff.
-            session.queued_buffers.clear();
-            for buffer in session.buffers.iter_mut() {
+            let mut shared = session.shared.lock().unwrap();
+            shared.queued_buffers.clear();
+            for buffer in shared.buffers.iter_mut() {
                 buffer.set_state(BufferState::New);
             }
-            self.active_session = Some(session.id);
+            self.active_session = Some(session_id);
         }
 
         let count = std::cmp::min(count, 32);
 
-        for buffer in &session.buffers {
-            self.mmap_manager.unregister_buffer(buffer.offset);
+        {
+            let shared = session.shared.lock().unwrap();
+            for buffer in &shared.buffers {
+                self.mmap_manager.unregister_buffer(buffer.offset);
+            }
         }
 
-        session.buffers = (0..count)
+        let buffers = (0..count)
             .map(|i| {
                 MemFdBuffer::new(BUFFER_SIZE as u64)
                     .map_err(|e| {
@@ -706,7 +792,9 @@ where
                         Ok(Buffer::new(v4l2_buffer, fd, offset))
                     })
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
+
+        session.shared.lock().unwrap().buffers = buffers;
 
         Ok(v4l2_requestbuffers {
             count,
@@ -728,7 +816,8 @@ where
         if queue != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }
-        let buffer = session.buffers.get(index as usize).ok_or(libc::EINVAL)?;
+        let shared = session.shared.lock().unwrap();
+        let buffer = shared.buffers.get(index as usize).ok_or(libc::EINVAL)?;
 
         Ok(buffer.v4l2_buffer.clone())
     }
@@ -739,34 +828,35 @@ where
         buffer: v4l2r::ioctl::V4l2Buffer,
         _guest_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<v4l2r::ioctl::V4l2Buffer> {
-        let host_buffer = session
-            .buffers
-            .get_mut(buffer.index() as usize)
-            .ok_or(libc::EINVAL)?;
-        // Attempt to queue already queued buffer.
-        if matches!(host_buffer.state, BufferState::Incoming) {
-            return Err(libc::EINVAL);
+        let mut shared = session.shared.lock().unwrap();
+        let buffer_index = buffer.index() as usize;
+        {
+            let host_buffer = shared
+                .buffers
+                .get_mut(buffer_index)
+                .ok_or(libc::EINVAL)?;
+            // Attempt to queue already queued buffer.
+            if matches!(host_buffer.state, BufferState::Incoming) {
+                return Err(libc::EINVAL);
+            }
+
+            host_buffer.set_state(BufferState::Incoming);
         }
+        shared.queued_buffers.push_back(buffer_index);
 
-        host_buffer.set_state(BufferState::Incoming);
-        session.queued_buffers.push_back(buffer.index() as usize);
-
-        let buffer = host_buffer.v4l2_buffer.clone();
-
-        if session.streaming {
-            session.process_queued_buffers(&mut self.evt_queue, &self.camera_pipe)?;
-        }
-
+        let buffer = shared.buffers[buffer_index].v4l2_buffer.clone();
         Ok(buffer)
     }
 
     fn streamon(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
-        if queue != QueueType::VideoCapture || session.buffers.is_empty() {
+        if queue != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }
-        session.streaming = true;
-
-        session.process_queued_buffers(&mut self.evt_queue, &self.camera_pipe)?;
+        let mut shared = session.shared.lock().unwrap();
+        if shared.buffers.is_empty() {
+            return Err(libc::EINVAL);
+        }
+        shared.streaming = true;
 
         Ok(())
     }
@@ -775,9 +865,10 @@ where
         if queue != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }
-        session.streaming = false;
-        session.queued_buffers.clear();
-        for buffer in session.buffers.iter_mut() {
+        let mut shared = session.shared.lock().unwrap();
+        shared.streaming = false;
+        shared.queued_buffers.clear();
+        for buffer in shared.buffers.iter_mut() {
             buffer.set_state(BufferState::New);
         }
 
@@ -899,8 +990,9 @@ where
                         id: CID_LENS_FACING,
                         ..Default::default()
                     };
+                    let session_id = session.shared.lock().unwrap().id;
                     self.evt_queue
-                        .send_event(V4l2Event::Event(SessionEvent::new(session.id, ctrl_event)));
+                        .send_event(V4l2Event::Event(SessionEvent::new(session_id, ctrl_event)));
                     Ok(())
                 }
                 _ => Err(libc::EINVAL),
@@ -948,4 +1040,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(sink, dummy_input);
     }
+
+
 }

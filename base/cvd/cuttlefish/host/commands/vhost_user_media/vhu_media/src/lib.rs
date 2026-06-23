@@ -169,6 +169,7 @@ impl VirtioMediaHostMemoryMapper for HostMemoryMapper {
     }
 }
 
+#[derive(Clone)]
 pub struct EventQueue {
     mem: GuestMemoryLoadGuard<GuestMemoryMmap>,
     vring: VringRwLock,
