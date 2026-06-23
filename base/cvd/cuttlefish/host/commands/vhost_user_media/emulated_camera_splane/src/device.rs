@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::Read;
 use std::io::Result as IoResult;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::path::PathBuf;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use v4l2r::PixelFormat;
@@ -156,6 +159,8 @@ pub struct EmulatedCameraSession {
     queued_buffers: VecDeque<usize>,
     /// Is the session currently streaming?
     streaming: bool,
+    /// Named pipe for streaming YUV frames from host.
+    pipe: Option<File>,
 }
 
 impl VirtioMediaDeviceSession for EmulatedCameraSession {
@@ -198,11 +203,33 @@ impl EmulatedCameraSession {
         Ok(())
     }
 
+    pub fn read_and_write_yuv_frame<R: Read, W: Write>(source: &mut R, mut sink: W) -> std::io::Result<()> {
+        let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
+        let mut frame_data = vec![0u8; frame_size];
+        source.read_exact(&mut frame_data)?;
+        sink.write_all(&frame_data)?;
+        Ok(())
+    }
+
     /// Write basic pattern into the queued buffers
     fn process_queued_buffers<Q: VirtioMediaEventQueue>(
         &mut self,
         evt_queue: &mut Q,
+        camera_pipe: &Option<PathBuf>,
     ) -> IoctlResult<()> {
+        if self.pipe.is_none() {
+            if let Some(path) = camera_pipe {
+                match File::open(path) {
+                    Ok(file) => {
+                        self.pipe = Some(file);
+                    }
+                    Err(_) => {
+                        return Err(libc::EIO);
+                    }
+                }
+            }
+        }
+
         while let Some(buf_id) = self.queued_buffers.pop_front() {
             let iteration = self.iteration;
             let buffer = self.buffers.get_mut(buf_id).ok_or(libc::EIO)?;
@@ -212,7 +239,11 @@ impl EmulatedCameraSession {
                 .seek(SeekFrom::Start(0))
                 .map_err(|_| libc::EIO)?;
 
-            Self::write_yuv420_pattern(iteration, buffer.fd.as_file()).map_err(|_| libc::EIO)?;
+            if let Some(ref mut pipe) = self.pipe {
+                Self::read_and_write_yuv_frame(pipe, buffer.fd.as_file()).map_err(|_| libc::EIO)?;
+            } else {
+                Self::write_yuv420_pattern(iteration, buffer.fd.as_file()).map_err(|_| libc::EIO)?;
+            }
 
             *buffer.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
             buffer.set_state(BufferState::Outgoing {
@@ -248,6 +279,8 @@ pub struct EmulatedCamera<Q: VirtioMediaEventQueue, HM: VirtioMediaHostMemoryMap
     active_session: Option<u32>,
     /// Lens facing configuration.
     lens_facing: LensFacing,
+    /// Path to the Named Pipe for camera streaming.
+    camera_pipe: Option<PathBuf>,
 }
 
 impl<Q, HM> EmulatedCamera<Q, HM>
@@ -255,12 +288,13 @@ where
     Q: VirtioMediaEventQueue,
     HM: VirtioMediaHostMemoryMapper,
 {
-    pub fn new(evt_queue: Q, mapper: HM, lens_facing: LensFacing) -> Self {
+    pub fn new(evt_queue: Q, mapper: HM, lens_facing: LensFacing, camera_pipe: Option<PathBuf>) -> Self {
         Self {
             evt_queue,
             mmap_manager: MmapMappingManager::from(mapper),
             active_session: None,
             lens_facing,
+            camera_pipe,
         }
     }
 
@@ -300,6 +334,7 @@ where
             buffers: Default::default(),
             queued_buffers: Default::default(),
             streaming: false,
+            pipe: None,
         })
     }
 
@@ -690,7 +725,7 @@ where
         let buffer = host_buffer.v4l2_buffer.clone();
 
         if session.streaming {
-            session.process_queued_buffers(&mut self.evt_queue)?;
+            session.process_queued_buffers(&mut self.evt_queue, &self.camera_pipe)?;
         }
 
         Ok(buffer)
@@ -702,7 +737,7 @@ where
         }
         session.streaming = true;
 
-        session.process_queued_buffers(&mut self.evt_queue)?;
+        session.process_queued_buffers(&mut self.evt_queue, &self.camera_pipe)?;
 
         Ok(())
     }
@@ -861,6 +896,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn test_write_yuv420_pattern_size() {
@@ -870,5 +906,17 @@ mod tests {
         // Verify output size matches exactly 1.5 bytes per pixel (YUV420p)
         let expected_size = (WIDTH * HEIGHT * 3 / 2) as usize;
         assert_eq!(buffer.len(), expected_size);
+    }
+
+    #[test]
+    fn test_read_and_write_yuv_frame() {
+        let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
+        let dummy_input = vec![0x55u8; frame_size];
+        let mut source = Cursor::new(dummy_input.clone());
+        let mut sink = Vec::new();
+
+        let result = EmulatedCameraSession::read_and_write_yuv_frame(&mut source, &mut sink);
+        assert!(result.is_ok());
+        assert_eq!(sink, dummy_input);
     }
 }

@@ -39,12 +39,16 @@ struct CmdLineArgs {
     /// Lens facing configuration: FRONT, BACK, or EXTERNAL.
     #[clap(long, value_name = "LENS_FACING", default_value = "BACK")]
     lens_facing: String,
+    /// Path to the Named Pipe for camera streaming. If omitted, Cuttlefish runs in Pattern Mode.
+    #[clap(long, value_name = "CAMERA_PIPE")]
+    camera_pipe: Option<PathBuf>,
 }
 
 #[derive(PartialEq, Debug)]
 struct Config {
     socket_path: PathBuf,
     lens_facing: LensFacing,
+    camera_pipe: Option<PathBuf>,
 }
 
 impl TryFrom<CmdLineArgs> for Config {
@@ -56,6 +60,7 @@ impl TryFrom<CmdLineArgs> for Config {
         Ok(Config {
             socket_path: args.socket_path,
             lens_facing,
+            camera_pipe: args.camera_pipe,
         })
     }
 }
@@ -85,10 +90,11 @@ fn start_backend(config: Config) -> Result<()> {
             card,
         };
         let lens_facing = config.lens_facing;
+        let camera_pipe = config.camera_pipe.clone();
         let backend = Arc::new(RwLock::new(VhuMediaBackend::new(
             device_config,
             move |event_queue, host_mapper| {
-                crate::device::EmulatedCamera::new(event_queue, host_mapper, lens_facing)
+                crate::device::EmulatedCamera::new(event_queue, host_mapper, lens_facing, camera_pipe.clone())
             },
         )));
         let mut daemon = VhostUserDaemon::new(
@@ -109,4 +115,22 @@ fn main() -> Result<()> {
     init_logging(args.verbosity)?;
 
     start_backend(Config::try_from(args)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_omitted_pipe_defaults_to_none() {
+        let args = CmdLineArgs::try_parse_from(&["emulated_camera_splane", "--socket-path", "/tmp/sock"]).unwrap();
+        assert_eq!(args.camera_pipe, None);
+    }
+
+    #[test]
+    fn test_cli_provided_pipe_parsed_correctly() {
+        let args = CmdLineArgs::try_parse_from(&["emulated_camera_splane", "--socket-path", "/tmp/sock", "--camera-pipe", "/tmp/my_pipe"]).unwrap();
+        assert_eq!(args.camera_pipe, Some(PathBuf::from("/tmp/my_pipe")));
+    }
 }
